@@ -1,6 +1,6 @@
 import argparse
 import configparser
-from datetime import datetime
+from datetime import datetime, timezone
 try:
     import grp, pwd
 except ModuleNotFoundError:
@@ -675,3 +675,590 @@ def cmd_rev_parse(args):
     repo = repo_find()
     print(object_find(repo, args.name, fmt, follow=True))
 
+class GitIndexEntry(object):
+    def __init__(self, ctime=None, mtime=None, dev=None, ino=None,
+                mode_type=None, mode_perms=None, uid=None, gid=None,
+                fsize=None, sha=None, flag_assume_valid=None,
+                flag_stage=None, name=None):
+        self.ctime = ctime
+        self.mtime = mtime
+        self.dev = dev
+        self.ino = ino
+        self.mode_type = mode_type
+        self.mode_perms = mode_perms
+        self.uid = uid
+        self.gid = gid
+        self.fsize = fsize
+        self.sha = sha
+        self.flag_assume_valid = flag_assume_valid
+        self.flag_stage = flag_stage
+        self.name = name
+
+class GitIndex(object):
+    version = None
+    entries = []
+
+    def __init__(self, version=2, entries=None):
+        if not entries:
+            entries = list()
+        self.version = version
+        self.entries = entries
+
+def index_read(repo):
+    index_file = repo_file(repo, "index")
+
+    if not os.path.exists(index_file):
+        return GitIndex()
+
+    with open(index_file, "rb") as f:
+        raw = f.read()
+
+    header = raw[:12]
+    signature = header[:4]
+    assert signature == b"DIRC"
+    version = int.from_bytes(header[4:8], "big")
+    assert version == 2, f"wyag only supports index file version 2"
+    count = int.from_bytes(header[8:12], "big")
+
+    entries = []
+    content = raw[12:]
+    idx = 0
+
+    for i in range(0, count):
+        ctime_s = int.from_bytes(content[idx:idx+4], "big")
+        ctime_ns = int.from_bytes(content[idx+4:idx+8], "big")
+        mtime_s = int.from_bytes(content[idx+8:idx+12], "big")
+        mtime_ns = int.from_bytes(content[idx+12:idx+16], "big")
+        dev = int.from_bytes(content[idx+16:idx+20], "big")
+        ino = int.from_bytes(content[idx+20:idx+24], "big")
+        unused = int.from_bytes(content[idx+24:idx+26], "big")
+        assert unused == 0
+        mode = int.from_bytes(content[idx+26:idx+28], "big")
+        mode_type = mode >> 12
+        mode_perms = mode & 0b0000000111111111
+        uid = int.from_bytes(content[idx+28:idx+32], "big")
+        gid = int.from_bytes(content[idx+32:idx+36], "big")
+        fsize = int.from_bytes(content[idx+36:idx+40], "big")
+        sha = format(int.from_bytes(content[idx+40:idx+60], "big"), "040x")
+        flags = int.from_bytes(content[idx+60:idx+62], "big")
+        flag_assume_valid = (flags & 0b1000000000000000) != 0
+        flag_extended = (flags & 0b0100000000000000) != 0
+        assert not flag_extended
+        flag_stage = flags & 0b0011000000000000
+        name_length = flags & 0b0000111111111111
+
+        idx += 62
+
+        if name_length < 0xFFF:
+            assert content[idx + name_length] == 0x00
+            raw_name = content[idx:idx+name_length]
+            idx += name_length + 1
+        else:
+            print("Notice: Name is 0xFFF bytes or longer.")
+            null_idx = content.find(b'\x00', idx + 0xFFF)
+            raw_name = content[idx:null_idx]
+            idx = null_idx + 1
+
+        name = raw_name.decode("utf8")
+        idx = 8 * ceil(idx / 8)
+
+        entries.append(GitIndexEntry(
+            ctime=(ctime_s, ctime_ns),
+            mtime=(mtime_s, mtime_ns),
+            dev=dev, ino=ino,
+            mode_type=mode_type,
+            mode_perms=mode_perms,
+            uid=uid, gid=gid,
+            fsize=fsize, sha=sha,
+            flag_assume_valid=flag_assume_valid,
+            flag_stage=flag_stage,
+            name=name))
+
+    return GitIndex(version=version, entries=entries)
+
+argsp = argsubparsers.add_parser("ls-files",
+                                help="List all staged files.")
+argsp.add_argument("--verbose", action="store_true",
+                help="Show everything.")
+
+def cmd_ls_files(args):
+    repo = repo_find()
+    index = index_read(repo)
+    if args.verbose:
+        print(f"Index file format v{index.version}, containing {len(index.entries)} entries.")
+        print()
+    for e in index.entries:
+        print(e.name)
+        if args.verbose:
+            print(f"  {e.mode_type:04o} {e.mode_perms:04o} {e.sha}\t{e.name}")
+            print(f"  ctime: {e.ctime[0]}.{e.ctime[1]}")
+            print(f"  mtime: {e.mtime[0]}.{e.mtime[1]}")
+            print(f"  dev: {e.dev}\t ino: {e.ino}")
+            print(f"  uid: {e.uid}\t gid: {e.gid}")
+            print(f"  size: {e.fsize}\t flags: {e.flag_stage}")
+
+argsp = argsubparsers.add_parser("check-ignore", help="Check path(s) against ignore rules.")
+argsp.add_argument("path", nargs="+", help="Paths to check")
+
+def cmd_check_ignore(args):
+    repo = repo_find()
+    rules = gitignore_read(repo)
+    for path in args.path:
+        if check_ignore(rules, path):
+            print(path)
+
+class GitIgnore(object):
+    absolute = None
+    scoped = None
+
+    def __init__(self, absolute, scoped):
+        self.absolute = absolute
+        self.scoped = scoped
+
+def gitignore_parse1(raw):
+    raw = raw.strip()
+    if not raw or raw[0] == "#":
+        return None
+    elif raw[0] == "!":
+        return (raw[1:], False)
+    elif raw[0] == "\\":
+        return (raw[1:], True)
+    else:
+        return (raw, True)
+
+def gitignore_parse(lines):
+    ret = list()
+    for line in lines:
+        parsed = gitignore_parse1(line)
+        if parsed:
+            ret.append(parsed)
+    return ret
+
+def gitignore_read(repo):
+    ret = GitIgnore(absolute=list(), scoped=dict())
+
+    repo_file_path = os.path.join(repo.gitdir, "info/exclude")
+    if os.path.exists(repo_file_path):
+        with open(repo_file_path, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+
+    if "XDG_CONFIG_HOME" in os.environ:
+        config_home = os.environ["XDG_CONFIG_HOME"]
+    else:
+        config_home = os.path.expanduser("~/.config")
+    global_file = os.path.join(config_home, "git/ignore")
+
+    if os.path.exists(global_file):
+        with open(global_file, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+
+    index = index_read(repo)
+    for entry in index.entries:
+        if entry.name == ".gitignore" or entry.name.endswith("/.gitignore"):
+            dir_name = os.path.dirname(entry.name)
+            contents = object_read(repo, entry.sha)
+            lines = contents.blobdata.decode("utf8").splitlines()
+            ret.scoped[dir_name] = gitignore_parse(lines)
+    return ret
+
+def check_ignore1(rules, path):
+    result = None
+    for (pattern, value) in rules:
+        if fnmatch(path, pattern):
+            result = value
+    return result
+
+def check_ignore_scoped(rules, path):
+    parent = os.path.dirname(path)
+    while True:
+        if parent in rules:
+            result = check_ignore1(rules[parent], path)
+            if result != None:
+                return result
+        if parent == "":
+            break
+        parent = os.path.dirname(parent)
+    return None
+
+def check_ignore_absolute(rules, path):
+    for ruleset in rules:
+        result = check_ignore1(ruleset, path)
+        if result != None:
+            return result
+    return False
+
+def check_ignore(rules, path):
+    if os.path.isabs(path):
+        raise Exception("This function requires path to be relative to the repository's root")
+    result = check_ignore_scoped(rules.scoped, path)
+    if result != None:
+        return result
+    return check_ignore_absolute(rules.absolute, path)
+
+def branch_get_active(repo):
+    with open(repo_file(repo, "HEAD"), "r") as f:
+        head = f.read()
+
+    if head.startswith("ref: refs/heads/"):
+        return head[16:-1]
+    else:
+        return False
+    
+def tree_to_dict(repo, ref, prefix=""):
+    ret = dict()
+    tree_sha = object_find(repo, ref, fmt=b"tree")
+    tree = object_read(repo, tree_sha)
+
+    for leaf in tree.items:
+        full_path = os.path.join(prefix, leaf.path)
+        if leaf.mode == b' 40000':
+            ret.update(tree_to_dict(repo, leaf.sha, full_path))
+        else:
+            ret[full_path] = leaf.sha
+
+    return ret
+
+def status_head_index(repo, index):
+    print("Changes to be committed:")
+
+    head = tree_to_dict(repo, "HEAD")
+    for entry in index.entries:
+        if entry.name in head:
+            if head[entry.name] != entry.sha:
+                print(f"  modified: {entry.name}")
+            del head[entry.name]
+        else:
+            print(f"  added:    {entry.name}")
+
+    for name in head.keys():
+        print(f"  deleted:  {name}")
+
+def status_index_worktree(repo, index):
+    print("Changes not staged for commit:")
+
+    ignore = gitignore_read(repo)
+    gitdir_prefix = repo.gitdir + os.path.sep
+
+    all_files = list()
+    for (root, _, files) in os.walk(repo.worktree):
+        if root == repo.gitdir or root.startswith(gitdir_prefix):
+            continue
+        for f in files:
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, repo.worktree)
+            all_files.append(rel_path)
+
+    for entry in index.entries:
+        full_path = os.path.join(repo.worktree, entry.name)
+        if not os.path.exists(full_path):
+            print(f"  deleted:  {entry.name}")
+        else:
+            stat = os.stat(full_path)
+            ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
+            mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
+            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+                new_sha = object_hash(open(full_path, "rb"), b"blob", None)
+                same = entry.sha == new_sha
+                if not same:
+                    print(f"  modified: {entry.name}")
+        if entry.name in all_files:
+            all_files.remove(entry.name)
+
+    print()
+    print("Untracked files:")
+    for f in all_files:
+        if not check_ignore(ignore, f):
+            print(f"  {f}")
+
+argsp = argsubparsers.add_parser("status", help="Show the working tree status.")
+
+def cmd_status(_):
+    repo = repo_find()
+    index = index_read(repo)
+
+    cmd_status_branch(repo)
+    cmd_status_head_index(repo, index)
+    print()
+    cmd_status_index_worktree(repo, index)
+
+def cmd_status_branch(repo):
+    branch = branch_get_active(repo)
+    if branch:
+        print(f"On branch {branch}.")
+    else:
+        print(f"HEAD detached at {object_find(repo, 'HEAD')}")
+
+def cmd_status_head_index(repo, index):
+    print("Changes to be committed:")
+    head = tree_to_dict(repo, "HEAD")
+    for entry in index.entries:
+        if entry.name in head:
+            if head[entry.name] != entry.sha:
+                print("  modified:", entry.name)
+            del head[entry.name]
+        else:
+            print("  added:   ", entry.name)
+    for entry in head.keys():
+        print("  deleted: ", entry)
+
+def cmd_status_index_worktree(repo, index):
+    print("Changes not staged for commit:")
+    ignore = gitignore_read(repo)
+    gitdir_prefix = repo.gitdir + os.path.sep
+    all_files = list()
+    for (root, _, files) in os.walk(repo.worktree, True):
+        if root == repo.gitdir or root.startswith(gitdir_prefix):
+            continue
+        for f in files:
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, repo.worktree)
+            all_files.append(rel_path)
+    for entry in index.entries:
+        full_path = os.path.join(repo.worktree, entry.name)
+        if not os.path.exists(full_path):
+            print("  deleted: ", entry.name)
+        else:
+            stat = os.stat(full_path)
+            ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
+            mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
+            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+                with open(full_path, "rb") as fd:
+                    new_sha = object_hash(fd, b"blob", None)
+                    same = entry.sha == new_sha
+                    if not same:
+                        print("  modified:", entry.name)
+        if entry.name in all_files:
+            all_files.remove(entry.name)
+    print()
+    print("Untracked files:")
+    for f in all_files:
+        if not check_ignore(ignore, f):
+            print(" ", f)
+
+def index_write(repo, index):
+    with open(repo_file(repo, "index"), "wb") as f:
+        f.write(b"DIRC")
+        f.write(index.version.to_bytes(4, "big"))
+        f.write(len(index.entries).to_bytes(4, "big"))
+
+        idx = 0
+        for e in index.entries:
+            f.write(e.ctime[0].to_bytes(4, "big"))
+            f.write(e.ctime[1].to_bytes(4, "big"))
+            f.write(e.mtime[0].to_bytes(4, "big"))
+            f.write(e.mtime[1].to_bytes(4, "big"))
+            f.write(e.dev.to_bytes(4, "big"))
+            f.write(e.ino.to_bytes(4, "big"))
+
+            mode = (e.mode_type << 12) | e.mode_perms
+            f.write(mode.to_bytes(4, "big"))
+
+            f.write(e.uid.to_bytes(4, "big"))
+            f.write(e.gid.to_bytes(4, "big"))
+            f.write(e.fsize.to_bytes(4, "big"))
+            f.write(int(e.sha, 16).to_bytes(20, "big"))
+
+            flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
+            name_bytes = e.name.encode("utf8")
+            nm = len(name_bytes)
+            if nm >= 0xFFF:
+                nm = 0xFFF
+            flags = flag_assume_valid | e.flag_stage | nm
+            f.write(flags.to_bytes(2, "big"))
+            f.write(name_bytes)
+            f.write(b'\x00')
+
+            idx += 62 + len(name_bytes) + 1
+            if idx % 8 != 0:
+                pad = 8 - (idx % 8)
+                f.write(b'\x00' * pad)
+                idx += pad
+
+argsp = argsubparsers.add_parser("rm", help="Remove files from the working tree and the index.")
+argsp.add_argument("path", nargs="+", help="Files to remove")
+
+def cmd_rm(args):
+    repo = repo_find()
+    rm(repo, args.path)
+
+def rm(repo, paths, delete=True, skip_missing=False):
+    index = index_read(repo)
+
+    worktree = repo.worktree + os.sep
+
+    abspaths = list()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if abspath.startswith(worktree):
+            abspaths.append(abspath)
+        else:
+            raise Exception(f"Cannot remove paths outside of worktree: {paths}")
+
+    kept_entries = list()
+    remove = list()
+
+    for e in index.entries:
+        full_path = os.path.join(repo.worktree, e.name)
+        if full_path in abspaths:
+            remove.append(full_path)
+            abspaths.remove(full_path)
+        else:
+            kept_entries.append(e)
+
+    if len(abspaths) > 0 and not skip_missing:
+        raise Exception(f"Cannot remove paths not in the index: {abspaths}")
+
+    if delete:
+        for path in remove:
+            os.unlink(path)
+
+    index.entries = kept_entries
+    index_write(repo, index)
+
+argsp = argsubparsers.add_parser("add", help="Add file contents to the index.")
+argsp.add_argument("path", nargs="+", help="Files to add")
+
+def cmd_add(args):
+    repo = repo_find()
+    add(repo, args.path)
+
+def add(repo, paths, delete=True, skip_missing=False):
+    rm(repo, paths, delete=False, skip_missing=True)
+
+    worktree = repo.worktree + os.sep
+
+    clean_paths = list()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if not (abspath.startswith(worktree) and os.path.isfile(abspath)):
+            raise Exception(f"Not a file, or outside the worktree: {path}")
+        relpath = os.path.relpath(abspath, repo.worktree)
+        clean_paths.append((abspath, relpath))
+
+    index = index_read(repo)
+
+    for (abspath, relpath) in clean_paths:
+        with open(abspath, "rb") as fd:
+            sha = object_hash(fd, b"blob", repo)
+
+        stat = os.stat(abspath)
+        ctime_s = int(stat.st_ctime)
+        ctime_ns = stat.st_ctime_ns % 10**9
+        mtime_s = int(stat.st_mtime)
+        mtime_ns = stat.st_mtime_ns % 10**9
+
+        entry = GitIndexEntry(
+            ctime=(ctime_s, ctime_ns),
+            mtime=(mtime_s, mtime_ns),
+            dev=stat.st_dev,
+            ino=stat.st_ino,
+            mode_type=0b1000,
+            mode_perms=0o644,
+            uid=stat.st_uid,
+            gid=stat.st_gid,
+            fsize=stat.st_size,
+            sha=sha,
+            flag_assume_valid=False,
+            flag_stage=0,
+            name=relpath)
+
+        index.entries.append(entry)
+
+    index.entries.sort(key=lambda e: e.name)
+    index_write(repo, index)
+
+def tree_from_index(repo, index):
+    contents = dict()
+    contents[""] = list()
+
+    for entry in index.entries:
+        dirname = os.path.dirname(entry.name)
+        key = dirname
+        while key != "":
+            if key not in contents:
+                contents[key] = list()
+            key = os.path.dirname(key)
+        if dirname not in contents:
+            contents[dirname] = list()
+        contents[dirname].append(entry)
+
+    sorted_paths = sorted(contents.keys(), key=len, reverse=True)
+
+    sha = dict()
+    for path in sorted_paths:
+        tree = GitTree()
+        for item in contents[path]:
+            if isinstance(item, GitIndexEntry):
+                leaf_mode = f"{item.mode_type:02o}{item.mode_perms:04o}".encode()
+                leaf = GitTreeLeaf(mode=leaf_mode, path=os.path.basename(item.name), sha=item.sha)
+            else:
+                leaf = GitTreeLeaf(mode=b"040000", path=item[0], sha=item[1])
+            tree.items.append(leaf)
+        sha[path] = object_write(tree, repo)
+
+        if path != "":
+            parent = os.path.dirname(path)
+            base = os.path.basename(path)
+            contents[parent].append((base, sha[path]))
+
+    return sha[""]
+
+argsp = argsubparsers.add_parser("commit", help="Record changes to the repository.")
+argsp.add_argument("-m",
+                metavar="message",
+                dest="message",
+                help="Message to associate with this commit.")
+
+def cmd_commit(args):
+    repo = repo_find()
+    index = index_read(repo)
+
+    tree = tree_from_index(repo, index)
+
+    commit = commit_create(repo,
+                        tree,
+                        object_find(repo, "HEAD"),
+                        gitconfig_read_user(gitconfig_read()),
+                        datetime.now(timezone.utc),
+                        args.message)
+
+    active_branch = branch_get_active(repo)
+    if active_branch:
+        with open(repo_file(repo, os.path.join("refs/heads", active_branch)), "w") as fd:
+            fd.write(commit + "\n")
+    else:
+        with open(repo_file(repo, "HEAD"), "w") as fd:
+            fd.write("\n")
+
+def gitconfig_read():
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME", "~/.config")
+    configfiles = [
+        os.path.expanduser(os.path.join(xdg_config_home, "git/config")),
+        os.path.expanduser("~/.gitconfig")
+    ]
+    config = configparser.ConfigParser()
+    config.read(configfiles)
+    return config
+
+def gitconfig_read_user(config):
+    if "user" in config:
+        if "name" in config["user"] and "email" in config["user"]:
+            return f"{config['user']['name']} <{config['user']['email']}>"
+    return None
+
+def commit_create(repo, tree, parent, author, timestamp, message):
+    commit = GitCommit()
+    commit.kvlm[b"tree"] = tree.encode("ascii")
+    if parent:
+        commit.kvlm[b"parent"] = parent.encode("ascii")
+
+    offset = int(timestamp.utcoffset().total_seconds())
+    hours = offset // 3600
+    minutes = (offset % 3600) // 60
+    tz = f"{'+' if offset > 0 else '-'}{abs(hours):02}{abs(minutes):02}"
+
+    author_str = f"{author} {int(timestamp.timestamp())} {tz}"
+    commit.kvlm[b"author"] = author_str.encode("utf8")
+    commit.kvlm[b"committer"] = author_str.encode("utf8")
+    commit.kvlm[None] = message.encode("utf8")
+    return object_write(commit, repo)
